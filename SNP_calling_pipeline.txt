@@ -1,0 +1,158 @@
+echo "G1.sh"
+echo "Test job starting at `date`"
+PREFIX="G1"
+REF="Rnor_6.0.fa"
+PWD=`pwd`
+dbSNP="Rattus_norvegicus.vcf"
+gatk="GenomeAnalysisTK.jar"
+picard="picard.jar"
+trimmomatic="trimmomatic.jar"
+
+## Trimming bad reads or fragments
+java -Xmx20g  $trimmomatic PE \
+	-phred64 $PREFIX.1.fq.gz $PREFIX.2.fq.gz \
+	$PREFIX.1_paired.fq.gz $PREFIX.1_unpaired.fq.gz \
+	$PREFIX.2_paired.fq.gz $PREFIX.2_unpaired.fq.gz \
+	LEADING:15 \
+	TRAILING:15 \
+	SLIDINGWINDOW:40:20 \
+	MINLEN:50
+echo "Done! Trimming"
+
+
+## Alignment
+bwa mem -t 12 -R "@RG\tID:$PREFIX\tLB:$PREFIX\tSM:$PREFIX\tPL:ILLUMINA" \
+	$REF \
+	$PREFIX.R1_paired.fq.gz $PREFIX.R2_paired.fq.gz| \
+	samtools view -bt $REF.fai -o $PREFIX.paired.bam -
+
+bwa mem -t 12 -R "@RG\tID:$PREFIX\tLB:$PREFIX\tSM:$PREFIX\tPL:ILLUMINA" \
+	$REF \
+	$PREFIX.R1_unpaired.fq.gz| \
+	samtools view -bt $REF.fai -o $PREFIX.un_1.bam -
+
+bwa mem -t 12 -R "@RG\tID:$PREFIX\tLB:$PREFIX\tSM:$PREFIX\tPL:ILLUMINA" \
+	$REF \
+	$PREFIX.R2_unpaired.fq.gz| \
+	samtools view -bt $REF.fai -o $PREFIX.un_2.bam -
+samtools merge $PREFIX.bam $PREFIX.paired.bam $PREFIX.un_1.bam $PREFIX.un_2.bam
+
+samtools sort $PREFIX.bam $PREFIX.sort
+mv $PREFIX.sort.bam $PREFIX.bam
+echo "Done! Alignment"
+
+
+
+## Mark Duplicates & INDEX
+java -Xmx20g -jar $picard MarkDuplicates \
+        INPUT=$PREFIX.bam \
+        OUTPUT=$PREFIX.markdup.bam \
+        METRICS_FILE=$PREFIX.metrics
+        echo "Done! MarkDuplicates.jar"
+
+
+java -Xmx20g -jar $picard BuildBamIndex \
+        INPUT=$PREFIX.markdup.bam
+echo "Done! BuildBamIndex.jar"
+
+
+## Local Relignment for Indel
+java -Xmx20g -jar $gatk \
+        -T RealignerTargetCreator \
+        -R $REF \
+        -I $PREFIX.markdup.bam \
+        --fix_misencoded_quality_scores \
+        --known $dbSNP \
+        -nt 12 \
+        -o $PREFIX.realign.intervals
+echo "Done RealignerTargetCreator"
+
+java -Xmx20g -jar $gatk \
+        -T IndelRealigner \
+        -R $REF \
+        -I $PREFIX.markdup.bam \
+        -known $dbSNP \
+        --fix_misencoded_quality_scores \
+        -targetIntervals $PREFIX.realign.intervals \
+        -o $PREFIX.realign.bam
+echo "Done IndelRealigner"
+
+## Base Quality Score Recalibration
+java -Xmx20g -jar $gatk \
+        -T BaseRecalibrator \
+        -R $REF \
+        -I $PREFIX.realign.bam \
+        -knownSites $dbSNP \
+        -o $PREFIX.recal.table
+echo "Done BaseRecalibrator"
+
+### export the recalibrated bam files
+java -Xmx20g -jar $gatk \
+        -T PrintReads \
+        -R $REF \
+        -I $PREFIX.realign.bam \
+        -BQSR $PREFIX.recal.table \
+        -nct 12 \
+        -o $PREFIX.recal.bam
+echo "Done PrintReads"
+
+
+### Haplotypecaller
+java -Xmx20g -jar $gatk \
+        -T HaplotypeCaller \
+        -R $REF \
+        -nct 12 \
+        -I $PREFIX.recal.bam \
+        -A DepthPerSampleHC \
+        -A AlleleBalanceBySample \
+        --dbsnp $dbSNP \
+        --genotyping_mode DISCOVERY \
+        -stand_emit_conf 10 \
+        -stand_call_conf 30 \
+        -o $PREFIX.vcf
+echo "Done SNPcaller"
+
+
+### SNP filter
+java -Xmx20g -jar $gatk \
+        -T SelectVariants \
+        -R $REF \
+        -V $PREFIX.vcf \
+        -selectType SNP \
+        -o $PREFIX.snp.vcf
+
+
+java -Xmx20g -jar $gatk \
+        -T VariantFiltration \
+        -R $REF \
+        -V $PREFIX.snp.vcf \
+        --filterExpression "QD < 2.0 || FS > 60.0 || MQ < 40.0 || SOR > 3.0 || DP > 200 ||MQRankSum < -12.5 || ReadPosRankSum < -8.0" \
+        --filterName "filter_flag" \
+        -o $PREFIX.snp_filtered.vcf
+
+
+java -Xmx20g -jar $gatk \
+        -T SelectVariants \
+        -R $REF \
+        -V $PREFIX.vcf \
+        -selectType INDEL \
+        -o $PREFIX.indel.vcf
+
+java -Xmx20g -jar $gatk \
+        -T VariantFiltration \
+        -R $REF \
+        -V $PREFIX.indel.vcf \
+        --filterExpression "QD < 2.0 || ReadPosRankSum < -20.0 || InbreedingCoeff < -0.8 || FS > 200.0 || SOR > 10.0 || DP > 200 " \
+        --filterName "filter_flag" \
+        -o $PREFIX.indel_filtered.vcf
+
+java -Xmx20g -jar $gatk \
+        -T CombineVariants \
+        -R $REF \
+        -genotypeMergeOptions UNIQUIFY \
+        -V $PREFIX.snp_filtered.vcf \
+        -V $PREFIX.indel_filtered.vcf \
+        -o $PREFIX.filtered.vcf
+
+echo "Done SNP Filteration"
+echo "Test job finished at `date`"
